@@ -1,34 +1,85 @@
-# KAI — Kubernetes AI Inference Energy Benchmarking Platform
+# KAI — Kubernetes AI Distributed Inference Platform
 
 ## Project Overview
 
-KAI is an experimental platform designed to measure and compare the energy consumption and performance characteristics of AI inference workloads under two distinct deployment scenarios:
+KAI is a platform that enables running **large AI models on clusters of low-end PCs** using Kubernetes. Each node in the cluster loads only the model layers it is responsible for, so no single machine needs enough VRAM or RAM for the entire model.
 
-1. **Local Execution** — Running an AI model on a single GPU without any orchestration layer.
-2. **Kubernetes Execution** — Running the same AI model split into chunks, distributed across multiple nodes in a Kubernetes cluster, with inter-chunk communication via gRPC.
+### Key Capabilities
 
-The platform collects GPU power draw, CPU usage, inference latency, throughput, and total energy consumption, then produces comparative analysis and visualizations.
+- **Distributed LLM Inference** — Run HuggingFace models (GPT-2, Phi-2, LLaMA, Mistral, etc.) split across multiple nodes.
+- **Layer-Wise Chunking** — Models are partitioned at transformer block boundaries. Each chunk loads only its weights.
+- **Smart Auto-Partitioning** — Automatically detects GPU VRAM and RAM on each node and assigns layers proportionally.
+- **Text Generation** — Full autoregressive generation pipeline with temperature, top-k, top-p sampling, and streaming output.
+- **Energy Benchmarking** — Measures GPU power draw, CPU usage, and inference latency to compare local vs. Kubernetes deployment costs.
+- **Single-Command CLI** — `python kai_cli.py run --model <name> --prompt "Hello" --max-tokens 100`
+
+### Quick Example
+
+```bash
+# Scan your hardware
+python kai_cli.py scan
+
+# Preview how a model would be split across 3 nodes
+python kai_cli.py partition --model microsoft/phi-2 --num-nodes 3
+
+# Run distributed inference
+python kai_cli.py run --model sshleifer/tiny-gpt2 --prompt "Once upon a time" --max-tokens 50 --stream
+
+# Run energy benchmark (original KAI workflow)
+python kai_cli.py benchmark --model transformer --mode local
+```
 
 ---
 
 ## Table of Contents
 
+- [Quick Example](#quick-example)
+- [How It Works](#how-it-works)
 - [Gap Analysis](#gap-analysis)
-- [Project Goals](#project-goals)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Project Structure](#project-structure)
 - [Architecture](#architecture)
+- [CLI Reference](#cli-reference)
 - [Quick Start — Local Mode](#quick-start--local-mode)
 - [Quick Start — Kubernetes Mode](#quick-start--kubernetes-mode)
-- [Running Both Modes](#running-both-modes)
 - [Analysis & Plotting](#analysis--plotting)
 - [Dashboard Usage](#dashboard-usage)
-- [CLI Reference](#cli-reference)
 - [Key Metrics](#key-metrics)
-- [Expected Outputs](#expected-outputs)
 - [Technology Stack](#technology-stack)
 - [Integration Testing Checklist](#integration-testing-checklist)
+
+---
+
+## How It Works
+
+```
+                    ┌─────────────┐
+                    │  kai_cli.py │
+                    │  (CLI)      │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │ Node A   │ │ Node B   │ │ Node C   │
+        │ (GPU 4GB)│ │ (GPU 6GB)│ │ (CPU)    │
+        │          │ │          │ │          │
+        │ Embed    │ │ Layer 8  │ │ Layer 20 │
+        │ Layer 0-7│ │ - 19     │ │ - 31     │
+        │          │ │          │ │ Norm     │
+        │          │ │          │ │ LM Head  │
+        └────┬─────┘ └────┬─────┘ └────┬─────┘
+             │  gRPC       │  gRPC      │
+             └─────────────┴────────────┘
+                    Pipeline
+```
+
+1. **HFModelLoader** loads a HuggingFace model's layer structure without loading full weights.
+2. **ResourceDetector** scans cluster nodes for GPU VRAM, RAM, and CPU cores.
+3. **AutoPartitioner** assigns layers to nodes proportional to their memory.
+4. **LayerChunker** creates chunks that each load only their assigned weights.
+5. **DistributedGenerator** chains chunks via gRPC for autoregressive text generation.
 
 ---
 
@@ -158,7 +209,13 @@ KAI/
 │   ├── cnn.py                    #   CNN classification model
 │   ├── chunker.py                #   Model splitting into N sequential chunks
 │   ├── chunk_server.py           #   gRPC server for a single model chunk
-│   └── gateway.py                #   HTTP gateway chaining chunk services
+│   ├── gateway.py                #   HTTP gateway chaining chunk services
+│   ├── hf_loader.py              #   HuggingFace model loader (layer extraction)
+│   ├── layer_chunker.py          #   Layer-wise model splitting for distributed inference
+│   ├── weight_utils.py           #   Partial weight loading from HF checkpoints
+│   ├── generation.py             #   Autoregressive text generation across chunks
+│   ├── resource_detector.py      #   GPU/CPU/RAM detection (local + K8s nodes)
+│   └── auto_partitioner.py       #   Smart layer-to-node assignment
 │
 ├── monitoring/                   # Power and performance monitoring
 │   ├── gpu_monitor.py            #   NVML-based GPU power/util/temp sampling
@@ -193,8 +250,13 @@ KAI/
 ├── proto/                        # gRPC definitions
 │   └── inference.proto           #   InferenceService with Infer + HealthCheck RPCs
 │
+├── tests/                        # Test suites
+│   ├── test_integration.py       #   25 integration tests (Phases 1-13)
+│   └── test_distributed.py       #   30 integration tests (Phases 14-18)
+│
 ├── logs/                         # Experiment output (JSON)
 ├── docs/                         # Phase documentation
+├── kai_cli.py                    # Unified CLI (run, scan, partition, benchmark, dashboard)
 ├── requirements.txt
 ├── BUILD_GUIDE.md
 └── README.md
@@ -460,7 +522,65 @@ python -m streamlit run dashboard/app.py --server.headless true --server.port 85
 
 ## CLI Reference
 
-### Unified Experiment Runner
+### KAI CLI (Distributed Inference)
+
+```
+python kai_cli.py <command> [OPTIONS]
+
+Commands:
+  run          Generate text with a distributed HuggingFace model
+  scan         Detect local GPU/CPU/RAM resources
+  partition    Preview how a model would be split across nodes
+  benchmark    Run energy benchmarking (original KAI workflow)
+  dashboard    Launch the Streamlit dashboard
+```
+
+#### `run` — Generate Text
+
+```
+python kai_cli.py run --model <hf_model> --prompt "text" [OPTIONS]
+
+Options:
+  --model         HuggingFace model name          (required)
+  --prompt        Input text prompt                (required)
+  --max-tokens    Maximum tokens to generate       (default: 100)
+  --temperature   Sampling temperature             (default: 0.7)
+  --top-k         Top-k sampling                   (default: 50)
+  --top-p         Nucleus sampling                 (default: 0.9)
+  --num-chunks    Number of model chunks           (default: 2)
+  --stream        Stream output token by token
+```
+
+#### `scan` — Detect Resources
+
+```
+python kai_cli.py scan [--mode local|kubernetes]
+```
+
+#### `partition` — Preview Layer Split
+
+```
+python kai_cli.py partition --model <hf_model> --num-nodes N
+```
+
+#### `benchmark` — Energy Benchmarking
+
+```
+python kai_cli.py benchmark [OPTIONS]
+
+Options:
+  --model         transformer | cnn               (default: transformer)
+  --mode          local | kubernetes | both        (default: local)
+  --iterations    Number of inference iterations   (default: 50)
+```
+
+#### `dashboard` — Streamlit Dashboard
+
+```
+python kai_cli.py dashboard
+```
+
+### Experiment Runner (Detailed Benchmarking)
 
 ```
 python -m experiments.experiment_runner [OPTIONS]
@@ -564,6 +684,7 @@ Latency percentiles (p50, p90, p95, p99) and standard deviation are also compute
 |-----------|-----------|
 | Language | Python 3.10+ |
 | Deep Learning | PyTorch |
+| HuggingFace Models | transformers, accelerate, safetensors, sentencepiece |
 | GPU Monitoring | pynvml (NVIDIA NVML) |
 | CPU Monitoring | psutil |
 | Inter-chunk Communication | gRPC + Protocol Buffers |
@@ -579,21 +700,40 @@ Latency percentiles (p50, p90, p95, p99) and standard deviation are also compute
 
 ## Integration Testing Checklist
 
-- [ ] Local mode runs end-to-end and produces logs
-- [ ] GPU monitoring records power, utilization, and temperature data correctly
-- [ ] CPU monitoring records per-core and overall utilization
-- [ ] Model chunking produces correct outputs (chunk chain output == full model output)
-- [ ] gRPC communication between chunks works (serialize → transmit → deserialize)
-- [ ] Docker images build successfully (chunk, gateway, monitor)
-- [ ] Kubernetes manifests deploy without errors
-- [ ] Kubernetes controller deploys, checks status, and tears down
-- [ ] Kubernetes mode runs end-to-end and produces logs
-- [ ] Analysis script processes both local and K8s result sets
-- [ ] Analyzer exports CSV and JSON summaries
-- [ ] All 8 plot types are generated as PNG files
-- [ ] Dashboard loads and displays data from result files
-- [ ] Unified experiment runner works in all three modes (local, kubernetes, both)
-- [ ] Combined results file includes comparison ratios
+### Energy Benchmarking (Phases 1-13) — 25 tests
+
+- [x] Local mode runs end-to-end and produces logs
+- [x] GPU monitoring records power, utilization, and temperature data correctly
+- [x] CPU monitoring records per-core and overall utilization
+- [x] Model chunking produces correct outputs (chunk chain output == full model output)
+- [x] gRPC communication between chunks works (serialize → transmit → deserialize)
+- [x] Docker images build successfully (chunk, gateway, monitor)
+- [x] Kubernetes manifests deploy without errors
+- [x] Kubernetes controller deploys, checks status, and tears down
+- [x] Kubernetes mode runs end-to-end and produces logs
+- [x] Analysis script processes both local and K8s result sets
+- [x] Analyzer exports CSV and JSON summaries
+- [x] All 8 plot types are generated as PNG files
+- [x] Dashboard loads and displays data from result files
+- [x] Unified experiment runner works in all three modes (local, kubernetes, both)
+- [x] Combined results file includes comparison ratios
+
+### Distributed LLM Inference (Phases 14-18) — 30 tests
+
+- [x] HFModelLoader loads model config, tokenizer, and layer structure
+- [x] Model architecture validation works for supported families
+- [x] LayerChunker splits model layers into correct number of chunks
+- [x] Embedding layer is always in chunk 0, norm+lm_head in last chunk
+- [x] Memory-based chunking distributes layers by budget
+- [x] DistributedGenerator produces text matching full model output
+- [x] Streaming generation yields tokens incrementally
+- [x] Temperature, top-k, and top-p sampling work correctly
+- [x] ResourceDetector detects local GPU VRAM, RAM, and CPU cores
+- [x] AutoPartitioner assigns layers proportional to node memory
+- [x] AutoPartitioner validates plan feasibility
+- [x] CLI `run` command generates text end-to-end
+- [x] CLI `scan` command reports hardware resources
+- [x] CLI `partition` command previews model split
 
 ---
 

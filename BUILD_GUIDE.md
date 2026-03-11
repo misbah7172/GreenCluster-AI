@@ -542,4 +542,248 @@ Phase 1  (Scaffolding)
 
 ---
 
+## Pivot: Distributed Inference for Large Models on Low-End Hardware
+
+> **Phases 14–18** extend KAI from an energy-benchmarking tool into a
+> **distributed inference platform** that can run large HuggingFace models
+> (e.g., LLaMA 7B, Mistral 7B, Phi-2) on clusters of low-end PCs using
+> Kubernetes. Each node loads only the layers it is responsible for, so no
+> single machine needs enough VRAM/RAM for the full model.
+
+---
+
+### Phase 14: HuggingFace Large Model Support
+
+**Goal:** Load real HuggingFace models (LLMs) and integrate them into the KAI pipeline alongside the existing benchmark models.
+
+**Tasks:**
+
+1. **`model/hf_loader.py`** — HuggingFace model loader.
+   - Accept a HuggingFace model name or local path (e.g., `microsoft/phi-2`, `meta-llama/Llama-2-7b-hf`).
+   - Load the tokenizer via `transformers.AutoTokenizer`.
+   - Load the model configuration and layer structure via `transformers.AutoModelForCausalLM` or `AutoConfig`.
+   - Support loading with `torch_dtype=torch.float16` / `bfloat16` to reduce memory.
+   - Provide `get_layer_list()` returning an ordered list of `(name, module)` for all model layers (embeddings, transformer blocks, output head).
+   - Provide `get_tokenizer()`, `get_config()` helper methods.
+   - **Memory-safe loading:** Support `device_map="meta"` or `low_cpu_mem_usage=True` to avoid loading full weights into RAM during layer enumeration.
+   - Validate that the model is a causal LM or encoder-decoder; refuse unsupported architectures.
+
+2. **Update `model/__init__.py`** — Expose the new module.
+
+3. **Update `requirements.txt`** — Add:
+   - `transformers>=4.36.0`
+   - `accelerate>=0.25.0`
+   - `sentencepiece>=0.1.99`
+   - `safetensors>=0.4.0`
+
+**Deliverables:**
+- `model/hf_loader.py` with `HFModelLoader` class
+- Able to enumerate layers of any HuggingFace causal LM without loading full weights
+- Tokenizer integration for encoding text prompts → token IDs
+
+---
+
+### Phase 15: Layer-Wise Distributed Chunking
+
+**Goal:** Split a large HuggingFace model layer-by-layer across nodes so each node holds only its assigned layers in memory.
+
+**Tasks:**
+
+1. **`model/layer_chunker.py`** — Layer-aware chunking for HuggingFace models.
+   - Accept the output of `HFModelLoader.get_layer_list()`.
+   - Split layers into N groups (configurable).
+   - Each chunk loads only its assigned layers' weights from disk/hub — NOT the full model.
+   - Use `safetensors` shard loading or `accelerate`'s `load_checkpoint_in_model` to load only specific layers.
+   - Each chunk is a `LayerChunk(nn.Module)` that:
+     - Holds its assigned layers.
+     - Accepts hidden states as input, returns hidden states as output.
+     - Handles embedding layer (chunk 0 only) and LM head (last chunk only).
+   - Provide `estimate_chunk_memory(chunk)` → estimated VRAM in MB.
+   - Provide `save_chunk_weights(chunk, path)` and `load_chunk_weights(chunk, path)`.
+
+2. **`model/weight_utils.py`** — Utility for partial weight loading.
+   - Map HuggingFace checkpoint shards to specific layer indices.
+   - Load only needed shard files for a given chunk.
+   - Support both `.safetensors` and `.bin` weight formats.
+   - Avoid loading the entire model into memory at any point.
+
+**Deliverables:**
+- Layer-wise chunking that loads only needed weights per chunk
+- Memory estimation per chunk
+- Chunk serialization for deployment to nodes
+
+---
+
+### Phase 16: Text Generation Inference Pipeline
+
+**Goal:** Implement a text generation pipeline that chains chunk services to perform autoregressive token generation across distributed nodes.
+
+**Tasks:**
+
+1. **`model/generation.py`** — Distributed text generation engine.
+   - Implement autoregressive generation loop:
+     1. Tokenize input prompt.
+     2. Forward through all chunks (chunk 0 → chunk 1 → ... → chunk N).
+     3. Chunk N returns logits; sample next token.
+     4. Append token to sequence; repeat until stop condition.
+   - Support generation parameters:
+     - `max_new_tokens`: maximum tokens to generate.
+     - `temperature`: sampling temperature.
+     - `top_k`: top-k sampling.
+     - `top_p`: nucleus sampling.
+     - `repetition_penalty`: penalize repeated tokens.
+   - Implement KV-cache forwarding:
+     - Each chunk maintains a key-value cache for its layers.
+     - On subsequent tokens, only the new token is forwarded (not the full sequence).
+     - Cache is stored on the chunk's device, passed by reference (not over network).
+   - Streaming support: yield tokens as they are generated.
+
+2. **Update `model/chunk_server.py`** — Extend the gRPC servicer:
+   - Add `InferCausal` RPC method for causal LM chunks.
+   - Handle KV-cache state across calls within a session.
+   - Accept `session_id` to maintain per-request caches.
+   - Add `ClearCache` RPC to free memory when generation is done.
+
+3. **Update `proto/inference.proto`** — Add new messages:
+   - `CausalInferRequest`: token IDs, session_id, generation step.
+   - `CausalInferResponse`: output logits/hidden states, cache status.
+   - `ClearCacheRequest` / `ClearCacheResponse`.
+
+4. **Update `model/gateway.py`** — Add generation endpoint:
+   - `POST /generate` accepts `{"prompt": "...", "max_tokens": 100, ...}`.
+   - Orchestrates the generation loop across chunk services.
+   - Returns generated text (and optionally streams tokens via SSE).
+
+**Deliverables:**
+- End-to-end text generation across distributed chunks
+- KV-cache support for efficient autoregressive decoding
+- Streaming token output
+- Generation parameter support (temperature, top_k, top_p)
+
+---
+
+### Phase 17: Smart Resource Detection & Auto-Partitioning
+
+**Goal:** Automatically detect available resources on each Kubernetes node and partition the model proportionally.
+
+**Tasks:**
+
+1. **`model/resource_detector.py`** — Node resource scanner.
+   - Query each Kubernetes node for:
+     - Available GPU VRAM (via NVML if GPU present, else 0).
+     - Available system RAM.
+     - CPU core count.
+   - Also detect GPU type (e.g., RTX 3050 Ti 4GB vs. GTX 1060 6GB).
+   - Return a sorted list of nodes with their capabilities.
+   - Support CPU-only nodes (layers can run on CPU with reduced speed).
+
+2. **`model/auto_partitioner.py`** — Intelligent model partitioner.
+   - Given the model's layer list and each node's capability:
+     - Estimate memory per layer (parameters × dtype size × ~1.2 overhead).
+     - Assign layers to nodes proportional to their available memory.
+     - Nodes with more VRAM get more layers.
+     - Ensure every layer is assigned to exactly one node.
+   - Handle edge cases:
+     - Model too large for the cluster → clear error message with requirements.
+     - Only one node available → all layers on that node.
+     - Mixed GPU/CPU nodes → GPU nodes get more layers.
+   - Output a partition plan: `{node_id: [layer_start, layer_end], ...}`.
+
+3. **Update `kubernetes/controller.py`** — Enhanced deployment:
+   - Use the partition plan to create per-node deployments.
+   - Pass `LAYER_START` and `LAYER_END` environment variables to chunk containers.
+   - Deploy chunk containers with appropriate resource limits matching node capabilities.
+
+**Deliverables:**
+- Automatic node capability detection
+- Proportional model partitioning based on real hardware
+- Partition plan generation and validation
+
+---
+
+### Phase 18: End-to-End CLI & Integration
+
+**Goal:** Provide a unified CLI that lets users run large models on their K8s cluster with a single command, plus update all documentation.
+
+**Tasks:**
+
+1. **`kai_cli.py`** — Main entry point (root of project).
+   - Subcommands:
+     - `kai run --model <hf_model_name> --prompt "Hello" --max-tokens 100`
+       → Downloads model, partitions across cluster, generates text.
+     - `kai scan` → Detect cluster resources and show capabilities.
+     - `kai partition --model <name> --preview`
+       → Show how the model would be split without deploying.
+     - `kai benchmark --model <name> --mode both`
+       → Run the original energy benchmarking workflow.
+     - `kai dashboard` → Launch the Streamlit dashboard.
+   - Progress indicators for model download, partitioning, deployment.
+   - Clean error messages for common failures (no cluster, OOM, etc.).
+
+2. **Update `docker/Dockerfile.chunk`** — Support HuggingFace models:
+   - Install `transformers`, `accelerate`, `safetensors`.
+   - Accept `HF_MODEL_NAME`, `LAYER_START`, `LAYER_END` env vars.
+   - Load only assigned layers on startup.
+
+3. **Update `README.md`** — Complete documentation rewrite:
+   - New project description: distributed inference platform for large AI models.
+   - Quick-start: "Run LLaMA 7B on 3 budget PCs."
+   - Architecture diagram showing layer distribution.
+   - Resource requirements table.
+   - Comparison with Petals, AirLLM, Ollama.
+
+4. **Update integration tests** — Add tests for new modules:
+   - Test HFModelLoader with a small model (e.g., `sshleifer/tiny-gpt2`).
+   - Test layer chunking produces valid chunks.
+   - Test generation pipeline end-to-end with tiny model.
+   - Test resource detector with mock data.
+   - Test auto-partitioner with various node configurations.
+
+**Deliverables:**
+- Single-command CLI for distributed LLM inference
+- Updated Docker images for HuggingFace model serving
+- Complete documentation and tests
+
+---
+
+## Updated Phase Dependency Graph
+
+```
+Phase 1-13  (Original KAI — Energy Benchmarking)
+   │         (All completed)
+   │
+   └── Phase 14  (HuggingFace Model Support)
+          │
+          ├── Phase 15  (Layer-Wise Chunking)
+          │      │
+          │      ├── Phase 16  (Generation Pipeline)
+          │      │
+          │      └── Phase 17  (Smart Resource Detection)
+          │             │
+          │             └── Phase 18  (E2E CLI & Integration)
+```
+
+---
+
+## Updated Technology Stack
+
+| Component            | Technology                                |
+|----------------------|-------------------------------------------|
+| Language             | Python 3.10+                              |
+| Deep Learning        | PyTorch                                   |
+| LLM Models           | HuggingFace Transformers + Accelerate     |
+| Weight Format        | SafeTensors                               |
+| Tokenization         | HuggingFace Tokenizers / SentencePiece    |
+| GPU Monitoring       | pynvml (NVIDIA NVML)                      |
+| CPU Monitoring       | psutil                                    |
+| Inter-chunk Comm     | gRPC + Protocol Buffers                   |
+| Containerization     | Docker (NVIDIA CUDA base images)          |
+| Orchestration        | Kubernetes                                |
+| K8s Client           | `kubernetes` Python package               |
+| Dashboard            | Streamlit                                 |
+| Plotting             | Matplotlib                                |
+| Data Handling        | Pandas, NumPy                             |
+
+---
+
 *This guide will be updated as development progresses. Await instruction to begin implementation.*

@@ -22,6 +22,12 @@ kubernetes>=28.1.0
 # Dashboard
 streamlit>=1.30.0
 
+# HuggingFace (distributed LLM inference)
+transformers>=4.36.0
+accelerate>=0.25.0
+sentencepiece>=0.1.99
+safetensors>=0.4.0
+
 # Analysis & Plotting
 matplotlib>=3.8.0
 pandas>=2.1.0
