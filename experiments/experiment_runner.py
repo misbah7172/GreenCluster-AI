@@ -91,6 +91,108 @@ def _run_k8s(
     )
 
 
+def _run_local_hf(
+    hf_model: str,
+    iterations: int,
+    device: str,
+    output_dir: str,
+    monitor_interval: float,
+    warmup: int,
+) -> Dict[str, Any]:
+    """Run a local HuggingFace model benchmark with energy monitoring.
+
+    Loads the model, runs repeated inference, and collects power/latency
+    metrics just like the standard local runner but using a real HF model.
+    """
+    import time
+    import torch
+    from model.hf_loader import HFModelLoader
+    from model.layer_chunker import LayerChunker
+    from model.generation import DistributedGenerator
+
+    if device == "auto":
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    loader = HFModelLoader(hf_model, dtype="float16")
+    chunker = LayerChunker(loader)
+    chunks = chunker.create_chunks(1)  # single chunk for local mode
+
+    # Load weights
+    from transformers import AutoModelForCausalLM
+    try:
+        real_model = AutoModelForCausalLM.from_pretrained(
+            hf_model, torch_dtype=torch.float16, low_cpu_mem_usage=True,
+        )
+        real_model.eval()
+        from model.hf_loader import HFModelLoader as _HFL
+        embed, blocks, norm, lm_head = _HFL._detect_structure(real_model)
+        real_map = {"embed": embed}
+        for i, b in enumerate(blocks):
+            real_map[f"layer_{i}"] = b
+        if norm is not None:
+            real_map["norm"] = norm
+        if lm_head is not None:
+            real_map["lm_head"] = lm_head
+        for chunk in chunks:
+            for name in chunk.layer_names:
+                if name in real_map:
+                    chunk.layers[name] = real_map[name]
+            chunk.to(device)
+            chunk.eval()
+    except Exception as e:
+        logger.warning("Could not load HF model for benchmark: %s", e)
+
+    tokenizer = loader.get_tokenizer()
+    gen = DistributedGenerator(chunks, tokenizer, device=device)
+
+    # Start monitoring
+    try:
+        from monitoring.metrics import MetricsCollector
+        collector = MetricsCollector(interval=monitor_interval)
+        collector.start()
+        has_monitor = True
+    except Exception:
+        has_monitor = False
+
+    # Warmup
+    for _ in range(warmup):
+        gen.generate(prompt="Hello", max_new_tokens=5, temperature=0.7)
+
+    # Measured iterations
+    latencies = []
+    for _ in range(iterations):
+        t0 = time.perf_counter()
+        gen.generate(prompt="The quick brown fox", max_new_tokens=10, temperature=0.7)
+        latencies.append((time.perf_counter() - t0) * 1000)
+
+    if has_monitor:
+        collector.stop()
+
+    avg_latency = sum(latencies) / len(latencies)
+    total_time_s = sum(latencies) / 1000
+    throughput = iterations / total_time_s if total_time_s > 0 else 0
+
+    result = {
+        "hf_model": hf_model,
+        "iterations": iterations,
+        "avg_latency_ms": round(avg_latency, 4),
+        "throughput_inferences_per_sec": round(throughput, 4),
+        "latencies_ms": [round(l, 4) for l in latencies],
+    }
+
+    if has_monitor:
+        metrics = collector.compute_summary()
+        result["avg_power_w"] = metrics.get("avg_gpu_power_w", 0.0)
+        result["total_energy_wh"] = metrics.get("total_energy_wh", 0.0)
+        result["energy_per_inference_wh"] = round(
+            result["total_energy_wh"] / iterations, 8
+        ) if iterations > 0 else 0.0
+
+    logger.info("HF benchmark: model=%s, avg_latency=%.2fms, throughput=%.2f inf/s",
+                hf_model, avg_latency, throughput)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Comparison
 # ---------------------------------------------------------------------------
@@ -205,6 +307,7 @@ def run_experiment(
     gateway_url: Optional[str] = None,
     wait_timeout: float = 300.0,
     auto_teardown: bool = True,
+    hf_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run local, kubernetes, or both experiments.
 
@@ -234,15 +337,18 @@ def run_experiment(
         Pod readiness timeout in seconds.
     auto_teardown : bool
         Teardown K8s resources after the experiment.
+    hf_model : str, optional
+        HuggingFace model name for benchmarking with real HF models.
 
     Returns
     -------
     dict
         Combined results with optional comparison.
     """
+    model_label = hf_model or model_type
     logger.info(
         "Experiment: mode=%s, model=%s, iterations=%d, batch_size=%d",
-        mode, model_type, iterations, batch_size,
+        mode, model_label, iterations, batch_size,
     )
 
     combined: Dict[str, Any] = {
@@ -250,6 +356,8 @@ def run_experiment(
         "model_type": model_type,
         "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if hf_model:
+        combined["hf_model"] = hf_model
 
     local_result = None
     k8s_result = None
@@ -257,15 +365,25 @@ def run_experiment(
     # --- Local ---
     if mode in ("local", "both"):
         logger.info("--- Starting LOCAL experiment ---")
-        local_result = _run_local(
-            model_type=model_type,
-            iterations=iterations,
-            batch_size=batch_size,
-            device=device,
-            output_dir=output_dir,
-            monitor_interval=monitor_interval,
-            warmup=warmup,
-        )
+        if hf_model:
+            local_result = _run_local_hf(
+                hf_model=hf_model,
+                iterations=iterations,
+                device=device,
+                output_dir=output_dir,
+                monitor_interval=monitor_interval,
+                warmup=warmup,
+            )
+        else:
+            local_result = _run_local(
+                model_type=model_type,
+                iterations=iterations,
+                batch_size=batch_size,
+                device=device,
+                output_dir=output_dir,
+                monitor_interval=monitor_interval,
+                warmup=warmup,
+            )
         combined["local"] = local_result
         logger.info("--- LOCAL experiment complete ---")
 

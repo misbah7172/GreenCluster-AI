@@ -35,7 +35,12 @@ RUN pip install --no-cache-dir \
     torch>=2.0.0 \
     grpcio>=1.60.0 \
     protobuf>=4.25.0 \
-    pynvml>=11.5.0
+    pynvml>=11.5.0 \
+    transformers>=4.36.0 \
+    accelerate>=0.25.0 \
+    safetensors>=0.4.0 \
+    sentencepiece>=0.1.99 \
+    bitsandbytes>=0.41.0
 
 # Copy application code
 COPY model/ model/
@@ -48,6 +53,10 @@ ENV NUM_CHUNKS=3
 ENV MODEL_TYPE=transformer
 ENV WEIGHTS_DIR=/data/chunks
 ENV PORT=50051
+ENV HF_MODEL_NAME=""
+ENV LAYER_START=0
+ENV LAYER_END=0
+ENV QUANTIZE=""
 
 # gRPC port
 EXPOSE ${PORT}

@@ -7,11 +7,13 @@ enough VRAM/RAM for the full model.
 
 Subcommands::
 
-    kai run      — Download a model, partition across cluster, generate text.
-    kai scan     — Detect cluster resources and show capabilities.
+    kai run       — Download a model, partition across cluster, generate text.
+    kai scan      — Detect cluster resources and show capabilities.
     kai partition — Preview how a model would be split (dry-run).
     kai benchmark — Run the original energy benchmarking workflow.
     kai dashboard — Launch the Streamlit dashboard.
+    kai build     — Build Docker images for chunk/gateway/monitor.
+    kai prepare   — Download model, chunk weights, save for K8s deployment.
 
 Usage::
 
@@ -20,6 +22,8 @@ Usage::
     python kai_cli.py partition --model microsoft/phi-2 --num-nodes 3
     python kai_cli.py benchmark --model transformer --mode local
     python kai_cli.py dashboard
+    python kai_cli.py build --tag kai:latest
+    python kai_cli.py prepare --model sshleifer/tiny-gpt2 --num-chunks 3
 """
 
 import argparse
@@ -28,6 +32,8 @@ import logging
 import os
 import subprocess
 import sys
+
+import torch
 
 logger = logging.getLogger("kai")
 
@@ -38,6 +44,10 @@ def cmd_run(args):
     from model.layer_chunker import LayerChunker, LayerChunk
     from model.generation import DistributedGenerator
     from model.resource_detector import ResourceDetector
+
+    quantize = getattr(args, "quantize", None)
+    if quantize:
+        print(f"[KAI] Quantization requested: {quantize}")
 
     print(f"[KAI] Loading model: {args.model}")
     loader = HFModelLoader(
@@ -83,7 +93,7 @@ def cmd_run(args):
 
     # Load real weights into chunks
     print("[KAI] Loading model weights...")
-    _load_real_weights(loader, chunks, args.device)
+    _load_real_weights(loader, chunks, args.device, quantize=quantize)
 
     # Generate
     tokenizer = loader.get_tokenizer()
@@ -213,15 +223,28 @@ def cmd_benchmark(args):
     """Run the original energy benchmarking workflow."""
     from experiments.experiment_runner import run_experiment
 
-    print(f"[KAI] Running benchmark: mode={args.mode}, model={args.model}")
-    results = run_experiment(
-        mode=args.mode,
-        model_type=args.model,
-        num_chunks=args.num_chunks,
-        iterations=args.iterations,
-        batch_size=args.batch_size,
-        output_dir=args.output_dir,
-    )
+    hf_model = getattr(args, "hf_model", None)
+    if hf_model:
+        print(f"[KAI] Running HF model benchmark: mode={args.mode}, model={hf_model}")
+        results = run_experiment(
+            mode=args.mode,
+            model_type="transformer",
+            num_chunks=args.num_chunks,
+            iterations=args.iterations,
+            batch_size=args.batch_size,
+            output_dir=args.output_dir,
+            hf_model=hf_model,
+        )
+    else:
+        print(f"[KAI] Running benchmark: mode={args.mode}, model={args.model}")
+        results = run_experiment(
+            mode=args.mode,
+            model_type=args.model,
+            num_chunks=args.num_chunks,
+            iterations=args.iterations,
+            batch_size=args.batch_size,
+            output_dir=args.output_dir,
+        )
     print("[KAI] Benchmark complete. Results saved to:", args.output_dir)
 
 
@@ -236,19 +259,144 @@ def cmd_dashboard(args):
     subprocess.run(cmd)
 
 
-def _load_real_weights(loader, chunks, device):
+def cmd_build(args):
+    """Build Docker images for KAI components."""
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    tag = args.tag
+    images = {
+        "chunk": os.path.join("docker", "Dockerfile.chunk"),
+        "gateway": os.path.join("docker", "Dockerfile.gateway"),
+        "monitor": os.path.join("docker", "Dockerfile.monitor"),
+    }
+
+    for name, dockerfile in images.items():
+        image_tag = f"{tag}-{name}" if tag != "kai:latest" else f"kai-{name}:latest"
+        print(f"[KAI] Building {name} image: {image_tag}")
+        cmd = [
+            "docker", "build",
+            "-f", dockerfile,
+            "-t", image_tag,
+            project_root,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[KAI] ERROR building {name}:")
+            print(result.stderr)
+            sys.exit(1)
+        print(f"[KAI] Built: {image_tag}")
+
+        if args.push:
+            print(f"[KAI] Pushing {image_tag}...")
+            push_result = subprocess.run(
+                ["docker", "push", image_tag],
+                capture_output=True, text=True,
+            )
+            if push_result.returncode != 0:
+                print(f"[KAI] ERROR pushing {name}:")
+                print(push_result.stderr)
+                sys.exit(1)
+            print(f"[KAI] Pushed: {image_tag}")
+
+    print("[KAI] All images built successfully.")
+
+
+def cmd_prepare(args):
+    """Download model, chunk weights, and save for K8s deployment."""
+    from model.hf_loader import HFModelLoader
+    from model.layer_chunker import LayerChunker
+
+    print(f"[KAI] Preparing model: {args.model}")
+    loader = HFModelLoader(
+        args.model,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        token=args.token,
+    )
+
+    try:
+        loader.validate_architecture()
+    except ValueError as e:
+        print(f"[KAI] Error: {e}")
+        sys.exit(1)
+
+    size_est = loader.get_model_size_estimate()
+    dtype_key = "float16_mb" if args.dtype in ("float16", "fp16") else "float32_mb"
+    est_mb = size_est.get(dtype_key, size_est["float32_mb"])
+    print(f"[KAI] Model: ~{size_est['params_millions']:.0f}M params, ~{est_mb:.0f} MB ({args.dtype})")
+
+    # Create chunks
+    num_chunks = args.num_chunks
+    print(f"[KAI] Partitioning into {num_chunks} chunks...")
+    chunker = LayerChunker(loader)
+    chunks = chunker.create_chunks(num_chunks)
+
+    for c in chunks:
+        print(f"  Chunk {c.chunk_id}: {c.layer_names} (~{c.estimate_memory_mb():.0f} MB)")
+
+    # Load weights and save per-chunk
+    print("[KAI] Loading and saving chunk weights...")
+    _load_real_weights(loader, chunks, "cpu", quantize=getattr(args, "quantize", None))
+
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    for chunk in chunks:
+        path = chunker.save_chunk_weights(chunk, output_dir)
+        print(f"  Saved chunk {chunk.chunk_id} -> {path}")
+
+    # Save chunk manifest
+    manifest = {
+        "model": args.model,
+        "dtype": args.dtype,
+        "num_chunks": num_chunks,
+        "quantize": getattr(args, "quantize", None),
+        "chunks": [
+            {
+                "chunk_id": c.chunk_id,
+                "layer_names": c.layer_names,
+                "memory_mb": round(c.estimate_memory_mb(), 2),
+            }
+            for c in chunks
+        ],
+    }
+    manifest_path = os.path.join(output_dir, "chunk_manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"[KAI] Manifest saved: {manifest_path}")
+    print("[KAI] Preparation complete. Chunk weights ready for K8s deployment.")
+
+
+def _load_real_weights(loader, chunks, device, quantize=None):
     """Load actual model weights into chunk modules.
 
-    For local single-machine mode, loads the full model then distributes
-    layers to chunks. For large models on limited hardware, this would
-    be replaced with shard-based loading via weight_utils.
+    For small models, loads the full model then distributes layers to chunks.
+    For large models (or when system RAM is limited), uses shard-based
+    loading via WeightMapper so only needed shards are read from disk.
     """
+    import psutil
     from transformers import AutoModelForCausalLM
 
     model_name = loader.model_name
     dtype = loader.torch_dtype
 
-    # Try loading with real weights
+    # Estimate model size to decide loading strategy
+    size_est = loader.get_model_size_estimate()
+    dtype_key = "float16_mb" if dtype == torch.float16 else "float32_mb"
+    est_mb = size_est.get(dtype_key, size_est["float32_mb"])
+    avail_ram_mb = psutil.virtual_memory().available / (1024 ** 2)
+
+    # Use shard-based loading if model is larger than 80% of available RAM
+    use_shard_loading = est_mb > avail_ram_mb * 0.8
+
+    if use_shard_loading:
+        logger.info(
+            "Model (~%.0f MB) exceeds 80%% of available RAM (~%.0f MB). "
+            "Using shard-based loading.",
+            est_mb, avail_ram_mb,
+        )
+        _load_weights_shard_based(loader, chunks, device, quantize)
+        return
+
+    # Full-model loading for small models
     try:
         real_model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -275,6 +423,12 @@ def _load_real_weights(loader, chunks, device):
     if lm_head is not None:
         real_layer_map["lm_head"] = lm_head
 
+    # Apply quantization if requested
+    if quantize:
+        from model.quantizer import quantize_module
+        for name, module in real_layer_map.items():
+            real_layer_map[name] = quantize_module(module, quantize)
+
     # Replace chunk modules with real-weight versions
     for chunk in chunks:
         for name in chunk.layer_names:
@@ -282,6 +436,39 @@ def _load_real_weights(loader, chunks, device):
                 chunk.layers[name] = real_layer_map[name]
         chunk.to(device)
         chunk.eval()
+
+
+def _load_weights_shard_based(loader, chunks, device, quantize=None):
+    """Load weights using shard-based loading for large models.
+
+    Only loads the checkpoint shards needed for each chunk, avoiding
+    loading the full model into RAM.
+    """
+    from model.weight_utils import WeightMapper
+
+    mapper = WeightMapper(
+        loader.model_name,
+        token=loader.token,
+    )
+
+    for chunk in chunks:
+        logger.info("Shard-loading weights for chunk %d: %s", chunk.chunk_id, chunk.layer_names)
+        try:
+            state_dict = mapper.load_state_dict_for_layers(chunk.layer_names, device=device)
+            # Load matching keys into the chunk
+            missing, unexpected = chunk.load_state_dict(state_dict, strict=False)
+            if missing:
+                logger.debug("Chunk %d missing keys (expected for partial load): %d", chunk.chunk_id, len(missing))
+            # Apply quantization if requested
+            if quantize:
+                from model.quantizer import quantize_module
+                for name in chunk.layer_names:
+                    if name in chunk.layers:
+                        chunk.layers[name] = quantize_module(chunk.layers[name], quantize)
+            chunk.to(device)
+            chunk.eval()
+        except Exception as e:
+            logger.warning("Shard-loading failed for chunk %d: %s", chunk.chunk_id, e)
 
 
 def main():
@@ -307,6 +494,8 @@ def main():
     run_parser.add_argument("--resource-mode", default="local", help="Resource scan mode (local/kubernetes)")
     run_parser.add_argument("--trust-remote-code", action="store_true")
     run_parser.add_argument("--token", default=None, help="HuggingFace token for gated models")
+    run_parser.add_argument("--quantize", default=None, choices=["4bit", "8bit"],
+                            help="Quantize model weights (4bit NF4 or 8bit INT8)")
     run_parser.set_defaults(func=cmd_run)
 
     # --- scan ---
@@ -328,6 +517,8 @@ def main():
     bench_parser = subparsers.add_parser("benchmark", help="Run energy benchmark (original KAI)")
     bench_parser.add_argument("--mode", default="local", choices=["local", "kubernetes", "both"])
     bench_parser.add_argument("--model", default="transformer", choices=["transformer", "cnn"])
+    bench_parser.add_argument("--hf-model", default=None,
+                              help="HuggingFace model name for benchmarking (overrides --model)")
     bench_parser.add_argument("--num-chunks", type=int, default=2)
     bench_parser.add_argument("--iterations", type=int, default=10)
     bench_parser.add_argument("--batch-size", type=int, default=8)
@@ -338,6 +529,24 @@ def main():
     dash_parser = subparsers.add_parser("dashboard", help="Launch Streamlit dashboard")
     dash_parser.add_argument("--port", type=int, default=8501)
     dash_parser.set_defaults(func=cmd_dashboard)
+
+    # --- build ---
+    build_parser = subparsers.add_parser("build", help="Build Docker images for KAI")
+    build_parser.add_argument("--tag", default="kai:latest", help="Base image tag")
+    build_parser.add_argument("--push", action="store_true", help="Push images after build")
+    build_parser.set_defaults(func=cmd_build)
+
+    # --- prepare ---
+    prep_parser = subparsers.add_parser("prepare", help="Download model and save chunk weights")
+    prep_parser.add_argument("--model", required=True, help="HuggingFace model name")
+    prep_parser.add_argument("--num-chunks", type=int, default=3, help="Number of chunks")
+    prep_parser.add_argument("--output-dir", default="data/chunks", help="Output directory")
+    prep_parser.add_argument("--dtype", default="float16", help="Weight dtype")
+    prep_parser.add_argument("--trust-remote-code", action="store_true")
+    prep_parser.add_argument("--token", default=None)
+    prep_parser.add_argument("--quantize", default=None, choices=["4bit", "8bit"],
+                             help="Quantize chunk weights (4bit NF4 or 8bit INT8)")
+    prep_parser.set_defaults(func=cmd_prepare)
 
     args = parser.parse_args()
 

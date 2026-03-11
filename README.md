@@ -12,6 +12,8 @@ KAI is a platform that enables running **large AI models on clusters of low-end 
 - **Text Generation** — Full autoregressive generation pipeline with temperature, top-k, top-p sampling, and streaming output.
 - **Energy Benchmarking** — Measures GPU power draw, CPU usage, and inference latency to compare local vs. Kubernetes deployment costs.
 - **Single-Command CLI** — `python kai_cli.py run --model <name> --prompt "Hello" --max-tokens 100`
+- **Quantization** — Optional 4-bit (NF4) and 8-bit (INT8) quantization via bitsandbytes to reduce memory per chunk.
+- **Docker Build & Prepare** — `kai build` builds all Docker images; `kai prepare` downloads, chunks, and saves weights for K8s deployment.
 
 ### Quick Example
 
@@ -25,8 +27,20 @@ python kai_cli.py partition --model microsoft/phi-2 --num-nodes 3
 # Run distributed inference
 python kai_cli.py run --model sshleifer/tiny-gpt2 --prompt "Once upon a time" --max-tokens 50 --stream
 
+# Run with 4-bit quantization to reduce VRAM usage
+python kai_cli.py run --model sshleifer/tiny-gpt2 --prompt "Hello" --quantize 4bit
+
+# Prepare chunk weights for K8s deployment
+python kai_cli.py prepare --model microsoft/phi-2 --num-chunks 3 --output-dir data/chunks
+
+# Build all Docker images
+python kai_cli.py build
+
 # Run energy benchmark (original KAI workflow)
 python kai_cli.py benchmark --model transformer --mode local
+
+# Benchmark a HuggingFace model directly
+python kai_cli.py benchmark --hf-model sshleifer/tiny-gpt2 --mode local
 ```
 
 ---
@@ -213,6 +227,7 @@ KAI/
 │   ├── hf_loader.py              #   HuggingFace model loader (layer extraction)
 │   ├── layer_chunker.py          #   Layer-wise model splitting for distributed inference
 │   ├── weight_utils.py           #   Partial weight loading from HF checkpoints
+│   ├── quantizer.py              #   4-bit/8-bit quantization via bitsandbytes
 │   ├── generation.py             #   Autoregressive text generation across chunks
 │   ├── resource_detector.py      #   GPU/CPU/RAM detection (local + K8s nodes)
 │   └── auto_partitioner.py       #   Smart layer-to-node assignment
@@ -252,7 +267,8 @@ KAI/
 │
 ├── tests/                        # Test suites
 │   ├── test_integration.py       #   25 integration tests (Phases 1-13)
-│   └── test_distributed.py       #   30 integration tests (Phases 14-18)
+│   ├── test_distributed.py       #   30 integration tests (Phases 14-18)
+│   └── test_phase19.py           #   27 integration tests (Phase 19)
 │
 ├── logs/                         # Experiment output (JSON)
 ├── docs/                         # Phase documentation
@@ -533,6 +549,8 @@ Commands:
   partition    Preview how a model would be split across nodes
   benchmark    Run energy benchmarking (original KAI workflow)
   dashboard    Launch the Streamlit dashboard
+  build        Build Docker images for chunk/gateway/monitor
+  prepare      Download model, chunk weights, save for K8s deployment
 ```
 
 #### `run` — Generate Text
@@ -549,6 +567,7 @@ Options:
   --top-p         Nucleus sampling                 (default: 0.9)
   --num-chunks    Number of model chunks           (default: 2)
   --stream        Stream output token by token
+  --quantize      Quantization mode (4bit/8bit)    (default: none)
 ```
 
 #### `scan` — Detect Resources
@@ -570,8 +589,32 @@ python kai_cli.py benchmark [OPTIONS]
 
 Options:
   --model         transformer | cnn               (default: transformer)
+  --hf-model      HuggingFace model name for HF benchmark
   --mode          local | kubernetes | both        (default: local)
   --iterations    Number of inference iterations   (default: 50)
+```
+
+#### `build` — Build Docker Images
+
+```
+python kai_cli.py build [OPTIONS]
+
+Options:
+  --tag           Base image tag                   (default: kai:latest)
+  --push          Push images after building
+```
+
+#### `prepare` — Prepare Chunk Weights for K8s
+
+```
+python kai_cli.py prepare --model <hf_model> [OPTIONS]
+
+Options:
+  --model         HuggingFace model name           (required)
+  --num-chunks    Number of chunks                  (default: 3)
+  --output-dir    Output directory                  (default: data/chunks)
+  --dtype         Weight dtype                      (default: float16)
+  --quantize      Quantize weights (4bit/8bit)      (default: none)
 ```
 
 #### `dashboard` — Streamlit Dashboard
@@ -693,6 +736,7 @@ Latency percentiles (p50, p90, p95, p99) and standard deviation are also compute
 | K8s Client | `kubernetes` Python package |
 | Dashboard | Streamlit |
 | Plotting | Matplotlib |
+| Quantization | bitsandbytes (4-bit NF4, 8-bit INT8) |
 | Data Handling | Pandas, NumPy |
 | Serialization | JSON, CSV |
 
@@ -734,6 +778,21 @@ Latency percentiles (p50, p90, p95, p99) and standard deviation are also compute
 - [x] CLI `run` command generates text end-to-end
 - [x] CLI `scan` command reports hardware resources
 - [x] CLI `partition` command previews model split
+
+### Gap Coverage & Production Readiness (Phase 19) — 27 tests
+
+- [x] CLI `build` subcommand builds Docker images for all components
+- [x] CLI `prepare` subcommand downloads model, chunks weights, saves manifest
+- [x] Chunk weight saving/loading produces valid PyTorch checkpoints
+- [x] HF model benchmarking via `--hf-model` flag in benchmark command
+- [x] `_run_local_hf` runs HF model benchmark with energy monitoring
+- [x] Shard-based weight loading for large models via WeightMapper
+- [x] Automatic strategy selection (full-load vs shard-load) based on RAM
+- [x] Quantizer module supports 4-bit and 8-bit estimation
+- [x] Quantizer gracefully handles missing bitsandbytes
+- [x] `--quantize` argument accepted by `run` and `prepare` commands
+- [x] Dockerfile includes HuggingFace and bitsandbytes dependencies
+- [x] requirements.txt includes bitsandbytes
 
 ---
 

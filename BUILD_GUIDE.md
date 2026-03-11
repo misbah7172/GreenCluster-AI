@@ -746,21 +746,86 @@ Phase 1  (Scaffolding)
 
 ---
 
+### Phase 19: Gap Coverage & Production Readiness
+
+**Goal:** Close 5 remaining gaps to make KAI fully operational end-to-end without manual steps, support real HuggingFace models in benchmarks, handle 70B+ parameter models, and add quantization support.
+
+**Tasks:**
+
+1. **`kai_cli.py build`** — Auto-build Docker images.
+   - Add `build` subcommand that runs `docker build` for all 3 images (chunk, gateway, monitor).
+   - Accepts `--tag` for custom image tags.
+   - Optionally pushes to a container registry with `--push`.
+   - Validates Docker is installed and accessible.
+
+2. **`kai_cli.py prepare`** — Save chunk weights for K8s deployment.
+   - Add `prepare` subcommand that downloads a model, splits it into chunks, and saves each chunk's weights to disk.
+   - Accepts `--model`, `--num-chunks`, `--output-dir`, `--dtype`.
+   - Output directory structure: `<output_dir>/chunk_0.pt`, `chunk_1.pt`, etc.
+   - These files are what K8s chunk pods mount from a shared volume (NFS/PVC).
+   - Uses shard-based loading (`WeightMapper`) for large models to avoid OOM.
+
+3. **Extend `benchmark` to support HuggingFace models.**
+   - Add `--hf-model` argument to `kai_cli.py benchmark`.
+   - When `--hf-model` is provided, use the HuggingFace model for both local and K8s benchmarks instead of the dummy transformer/CNN.
+   - Local mode: loads model on single GPU, runs generation, records energy.
+   - K8s mode: deploys chunks via controller, runs generation through gateway, records energy.
+   - Comparison output includes energy/power ratios proving distributed = lower power.
+
+4. **Integrate shard-based weight loading into CLI for 70B+ models.**
+   - Update `_load_real_weights()` in `kai_cli.py` to use `WeightMapper.load_state_dict_for_layers()` when the full model would exceed available RAM.
+   - Detect available system memory and choose between full-model load (fast, for small models) vs. shard-by-shard load (memory-safe, for large models).
+   - Each chunk loads only its own weight shards — never the full model.
+
+5. **Add quantization support via `bitsandbytes`.**
+   - Create `model/quantizer.py` — Quantization utility.
+     - Support 4-bit (NF4) and 8-bit (INT8) quantization via `bitsandbytes`.
+     - `quantize_chunk(chunk, mode="4bit"|"8bit")` quantizes a LayerChunk in-place.
+     - `estimate_quantized_memory(chunk, mode)` returns expected memory after quantization.
+   - Add `--quantize` argument to `kai_cli.py run` and `kai_cli.py prepare`.
+   - When enabled, each chunk is quantized after weight loading.
+   - Reduces memory per chunk by 4-8x while maintaining near-full-precision output.
+   - Update `requirements.txt` with `bitsandbytes>=0.41.0`.
+
+6. **Update Docker images for HuggingFace support.**
+   - Update `Dockerfile.chunk` to install `transformers`, `accelerate`, `safetensors`, `bitsandbytes`.
+   - Add `HF_MODEL_NAME`, `LAYER_START`, `LAYER_END`, `QUANTIZE` env vars.
+   - Chunk container loads only its assigned layers on startup using `WeightMapper`.
+
+7. **Add integration tests for all new functionality.**
+   - Test `build` command (validates Docker command construction).
+   - Test `prepare` command (saves and reloads chunk weights).
+   - Test shard-based loading with a small model.
+   - Test quantization (4-bit/8-bit) on a small model.
+   - Test HF benchmark mode.
+
+**Deliverables:**
+- `kai_cli.py build` and `kai_cli.py prepare` commands
+- HuggingFace model support in benchmark mode
+- Shard-based weight loading for 70B+ models
+- `model/quantizer.py` with 4-bit and 8-bit quantization
+- Updated Docker images
+- Integration tests for all new features
+
+---
+
 ## Updated Phase Dependency Graph
 
 ```
-Phase 1-13  (Original KAI — Energy Benchmarking)
-   │         (All completed)
-   │
-   └── Phase 14  (HuggingFace Model Support)
-          │
-          ├── Phase 15  (Layer-Wise Chunking)
-          │      │
-          │      ├── Phase 16  (Generation Pipeline)
-          │      │
-          │      └── Phase 17  (Smart Resource Detection)
-          │             │
-          │             └── Phase 18  (E2E CLI & Integration)
+Phase 1-13  (Original KAI -- Energy Benchmarking)
+   |         (All completed)
+   |
+   +-- Phase 14  (HuggingFace Model Support)
+          |
+          +-- Phase 15  (Layer-Wise Chunking)
+          |      |
+          |      +-- Phase 16  (Generation Pipeline)
+          |      |
+          |      +-- Phase 17  (Smart Resource Detection)
+          |             |
+          |             +-- Phase 18  (E2E CLI & Integration)
+          |                    |
+          |                    +-- Phase 19  (Gap Coverage & Production Readiness)
 ```
 
 ---
@@ -774,6 +839,7 @@ Phase 1-13  (Original KAI — Energy Benchmarking)
 | LLM Models           | HuggingFace Transformers + Accelerate     |
 | Weight Format        | SafeTensors                               |
 | Tokenization         | HuggingFace Tokenizers / SentencePiece    |
+| Quantization         | bitsandbytes (4-bit NF4, 8-bit INT8)      |
 | GPU Monitoring       | pynvml (NVIDIA NVML)                      |
 | CPU Monitoring       | psutil                                    |
 | Inter-chunk Comm     | gRPC + Protocol Buffers                   |
