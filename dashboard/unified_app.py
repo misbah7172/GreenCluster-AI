@@ -200,7 +200,8 @@ def page_home():
             from model.resource_detector import ResourceDetector
             k8s_det = ResourceDetector(mode="kubernetes")
             k8s_sum = k8s_det.scan_summary()
-            st.success(f"Connected! {k8s_sum['num_nodes']} node(s) found")
+            k8s_sum = _augment_k8s_with_local_gpu(k8s_sum)
+            st.success(f"Connected! {k8s_sum['num_nodes']} node(s), {k8s_sum.get('gpu_nodes', 0)} GPU node(s)")
             st.dataframe(pd.DataFrame(k8s_sum.get("nodes", [])), hide_index=True)
         except Exception as e:
             st.warning(f"Kubernetes not reachable: {e}")
@@ -409,6 +410,50 @@ def page_run_inference():
 # Page 3: Cluster Setup
 # -------------------------------------------------------------------
 
+def _augment_k8s_with_local_gpu(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """When K8s reports no GPUs (e.g. Docker Desktop), augment nodes with local GPU info.
+
+    Docker Desktop Kubernetes doesn't expose nvidia.com/gpu resources unless
+    the NVIDIA device plugin DaemonSet is installed. This helper detects the
+    local GPU via NVML and patches the K8s node data so the dashboard shows
+    accurate GPU information.
+    """
+    if summary.get("gpu_nodes", 0) > 0:
+        return summary  # already has GPU info
+
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        gpu_count = pynvml.nvmlDeviceGetCount()
+        if gpu_count == 0:
+            pynvml.nvmlShutdown()
+            return summary
+
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        gpu_vram_mb = mem_info.total / (1024 ** 2)
+        gpu_type = pynvml.nvmlDeviceGetName(handle)
+        if isinstance(gpu_type, bytes):
+            gpu_type = gpu_type.decode("utf-8")
+        pynvml.nvmlShutdown()
+    except Exception:
+        return summary  # no local GPU either
+
+    # Patch the first node (Docker Desktop = single node running locally)
+    nodes = summary.get("nodes", [])
+    if nodes:
+        nodes[0]["gpu_type"] = gpu_type
+        nodes[0]["gpu_vram_mb"] = gpu_vram_mb
+        usable_vram = max(0, gpu_vram_mb - 500)
+        nodes[0]["usable_mb"] = usable_vram
+
+    summary["gpu_nodes"] = 1
+    summary["cpu_only_nodes"] = max(0, summary.get("cpu_only_nodes", 1) - 1)
+    summary["total_gpu_vram_mb"] = gpu_vram_mb
+    summary["total_usable_mb"] = sum(n.get("usable_mb", 0) for n in nodes)
+    return summary
+
+
 def page_cluster_setup():
     st.title("Cluster Setup")
 
@@ -424,7 +469,11 @@ def page_cluster_setup():
             try:
                 from model.resource_detector import ResourceDetector
                 det = ResourceDetector(mode=scan_mode)
-                st.session_state["cluster_summary"] = det.scan_summary()
+                summary = det.scan_summary()
+                # For K8s mode: augment with local GPU when K8s doesn't expose GPU resources
+                if scan_mode == "kubernetes":
+                    summary = _augment_k8s_with_local_gpu(summary)
+                st.session_state["cluster_summary"] = summary
             except Exception as e:
                 st.error(f"Scan failed: {e}")
                 return
@@ -441,9 +490,18 @@ def page_cluster_setup():
     mc3.metric("Total VRAM", f"{summary.get('total_gpu_vram_mb', 0):.0f} MB")
     mc4.metric("Total RAM", f"{summary.get('total_ram_mb', 0):.0f} MB")
 
+    # --- Docker Desktop hint ---
+    nodes = summary.get("nodes", [])
+    is_docker_desktop = any(n.get("name") == "docker-desktop" for n in nodes)
+    if is_docker_desktop:
+        st.info(
+            "**Docker Desktop detected.** GPU info was augmented from your local machine via NVML. "
+            "For native K8s GPU scheduling, install the "
+            "[NVIDIA device plugin](https://github.com/NVIDIA/k8s-device-plugin)."
+        )
+
     # --- Node table ---
     st.subheader("Discovered Nodes")
-    nodes = summary.get("nodes", [])
     if nodes:
         st.dataframe(pd.DataFrame(nodes), hide_index=True)
 

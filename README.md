@@ -262,7 +262,8 @@ KAI/
 │   └── plots.py                  #   Matplotlib visualization (10 plot types incl. migration/offloading)
 │
 ├── dashboard/                    # Web dashboard
-│   └── app.py                    #   Streamlit interactive visualization (+ migration/offloading panels)
+│   ├── unified_app.py           #   Unified 7-page Streamlit dashboard (default)
+│   └── app.py                    #   Legacy analysis-only Streamlit dashboard
 │
 ├── kubernetes/                   # Kubernetes configuration
 │   ├── controller.py             #   Python K8s controller (deploy/status/teardown + DEAS + thresholds)
@@ -527,34 +528,115 @@ Ten plot types are generated as PNG files:
 
 ## Dashboard Usage
 
-Launch the interactive Streamlit dashboard:
+KAI includes a unified 7-page web dashboard for managing every aspect of the platform — from running local AI models to deploying on Kubernetes clusters.
+
+### Launching the Dashboard
 
 ```bash
-python -m streamlit run dashboard/app.py
+# Default: launches the unified dashboard
+python kai_cli.py dashboard
+
+# Specify a custom port
+python kai_cli.py dashboard --port 8502
+
+# Legacy analysis-only dashboard
+python kai_cli.py dashboard --legacy
 ```
 
-The dashboard provides:
+The dashboard opens in your browser at `http://localhost:8501`.
 
-- **Sidebar**: Select result files from `logs/`, filter by mode (Local / K8s / Both), load a second file for comparison, enable auto-refresh.
-- **Summary Metrics**: Comparison table with ratio column, or KPI metric cards for single-mode results.
-- **GPU Power Over Time**: Interactive line chart from per-sample GPU power data.
-- **GPU Utilization Over Time**: Interactive line chart from utilization samples.
-- **Latency Comparison**: Average latency bar chart and per-iteration distribution.
-- **Energy Comparison**: Total energy and energy-per-inference bar charts.
-- **Per-Chunk Latency**: K8s-only bar chart of chunk processing times.
-- **Migration Energy Impact**: Power timeline with migration event annotations and summary table (Phase 23).
-- **VRAM vs RAM Execution Trade-off**: Side-by-side GPU vs CPU latency per chunk with memory saved annotations (Phase 23).
-- **Experiment Configuration**: Collapsible JSON view of experiment parameters.
-- **Raw JSON Viewer**: Full raw data inspection.
+### Page 1: Home — System Overview
+
+Scans your local machine and displays:
+
+- **GPU** — Name, VRAM (via NVML/pynvml)
+- **System RAM** — Total physical memory
+- **CPU Cores** — Physical core count
+- **Model Compatibility Table** — Shows which popular models (GPT-2 through Llama-2-70B) fit in your available memory
+- **Kubernetes Cluster Check** — Expander that probes your K8s cluster (if connected) and shows node resources
+
+**First thing to do:** Click **"Rescan System"** to verify your GPU is detected. If GPU shows "none", install pynvml: `pip install pynvml`.
+
+### Page 2: Run Inference — Generate Text
+
+Run AI models directly from the dashboard:
+
+1. **Select a model** from the dropdown (GPT-2, Phi-2, Gemma-2B, Falcon-7B, Mistral-7B, Llama-2-7B, Qwen2-7B) or enter a custom HuggingFace model name
+2. **Load Model Info** — fetches parameter count, FP16/FP32/INT8 size estimates
+3. **Configure generation** — prompt, max tokens, temperature, top-k, top-p, repetition penalty
+4. **Choose device** — `cpu`, `cuda:0`, or `auto`
+5. **Set dtype** — float16, bfloat16, or float32
+6. **Offloading options** — Enable FlexGen-style GPU→RAM→Disk offloading for models too large for your GPU
+7. **Partition Preview** — See how the model would be split across chunks
+8. Click **"Generate"** — output streams in real-time
+
+**Recommended first test:** Select `sshleifer/tiny-gpt2` (smallest model, ~250 MB), set device to `cpu`, and generate a few tokens to verify everything works.
+
+### Page 3: Cluster Setup — Resource Discovery
+
+Scan and inspect cluster resources:
+
+- **Local mode** — Scans your machine via NVML + psutil
+- **Kubernetes mode** — Queries K8s API for all nodes, automatically augments GPU info from your local machine when using Docker Desktop (which doesn't expose `nvidia.com/gpu` resources by default)
+- **Node Table** — Shows all discovered nodes with GPU type, VRAM, RAM, and usable memory
+- **Model Compatibility** — Which models fit in your cluster's combined memory
+- **Custom Model Check** — Enter any HuggingFace model name to check if it fits
+
+**Docker Desktop users:** The dashboard auto-detects Docker Desktop and augments K8s node data with your local GPU info via NVML. For production K8s clusters, install the [NVIDIA device plugin](https://github.com/NVIDIA/k8s-device-plugin) for native GPU scheduling.
+
+### Page 4: Kubernetes Deploy — Full Deployment Pipeline
+
+Five-step deployment workflow:
+
+1. **Prepare Weights** — Downloads a HuggingFace model, splits it into N chunks, saves weight files. Configure model name, chunk count, dtype, and output directory.
+2. **Build Docker Images** — Builds chunk server, gateway, and monitor Docker images. Optionally pushes to a registry.
+3. **Deploy Pipeline** — Deploys all K8s resources (chunk pods, gateway, monitor DaemonSet). Configure chunk count and model type.
+4. **Pod Status** — Shows current status of all KAI pods in the cluster.
+5. **Teardown** — Deletes all KAI resources from the cluster.
+
+Each step shows real-time subprocess output so you can monitor progress.
+
+### Page 5: Benchmark — Energy Analysis
+
+Run controlled experiments comparing local vs. Kubernetes inference:
+
+- **Mode** — `local`, `kubernetes`, or `both`
+- **Model type** — `transformer` or `cnn` (built-in models), or specify a HuggingFace model name
+- **Iterations** — Number of inference runs (more = more statistically reliable)
+- **Batch size** — Input tensor batch size
+- **Sampling rate** — GPU power sampling interval (0.1s = 100ms for high-frequency data)
+- **DEAS** — Enable Dynamic Energy-Aware Scheduling with configurable cooldown
+- **Output** — Results saved as JSON in the specified output directory
+
+Click **"Run Benchmark"** and watch real-time logs. Results appear with metric cards (latency, throughput, power, energy) and raw JSON.
+
+### Page 6: Monitor — Live GPU Metrics
+
+Real-time GPU monitoring dashboard:
+
+- **Start/Stop** monitoring with configurable sampling interval
+- **Threshold service** — Enables power threshold alerts (optimal/warning/critical based on TDP)
+- **Live metric cards** — Power (W), Utilization (%), Temperature (C), Memory Used (MB)
+- **Live charts** — Power, temperature, utilization, and memory usage over time (last 60 samples)
+- **Event history** — Recent threshold crossing events (when threshold service is enabled)
+- **Auto-refresh** — Configurable 1-10 second refresh rate
+
+### Page 7: Analysis — Experiment Results
+
+Interactive visualization of benchmark results:
+
+- **File selector** — Pick any result JSON from the logs directory
+- **Mode detection** — Automatically detects local, kubernetes, or combined results
+- **Comparison mode** — Load a second file to compare two experiments side-by-side
+- **Summary metrics** — KPI cards or comparison table with K8s/Local ratios
+- **Charts** — GPU power over time, utilization over time, latency comparison, energy comparison, per-chunk latency, migration energy impact, VRAM vs RAM trade-off
+- **Raw data** — Collapsible JSON viewer for full inspection
 
 ### Custom Logs Directory
 
 ```bash
 # Use a custom results directory
-KAI_LOGS_DIR=path/to/results python -m streamlit run dashboard/app.py
-
-# Headless mode (e.g. on a remote server)
-python -m streamlit run dashboard/app.py --server.headless true --server.port 8501
+KAI_LOGS_DIR=path/to/results python kai_cli.py dashboard
 ```
 
 ---
@@ -647,7 +729,11 @@ Options:
 #### `dashboard` — Streamlit Dashboard
 
 ```
-python kai_cli.py dashboard
+python kai_cli.py dashboard [OPTIONS]
+
+Options:
+  --port          Server port                       (default: 8501)
+  --legacy        Launch the legacy analysis-only dashboard instead of the unified dashboard
 ```
 
 ### Experiment Runner (Detailed Benchmarking)
